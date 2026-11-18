@@ -78,6 +78,44 @@ def _advance_draft_forward_metadata_if_supported(attn_backend, seq_lens) -> None
         advance(seq_lens)
 
 
+def draft_step_offsets(
+    num_steps: int, lanes: int, device: torch.device | str
+) -> torch.Tensor:
+    """``[3, num_steps]`` int32 offsets of draft decode step ``j`` from the
+    loop's cache start: its write position (``j``), its read length (``j + 1``,
+    the attention kernels' read-inclusive convention) and the start of its
+    ``lanes``-slot write window (``j * lanes``)."""
+    steps = torch.arange(num_steps, dtype=torch.int32, device=device)
+    return torch.stack((steps, steps + 1, steps * lanes))
+
+
+def draft_step_inputs(
+    cache_start: torch.Tensor, step_offsets: torch.Tensor, lanes: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Every draft decode step's inputs from the loop's per-request
+    ``cache_start``, in one launch (plus a lane expansion for a tree) instead
+    of in-place increments between the steps.
+
+    Args:
+        cache_start: ``[bs]`` int32 position the loop's first step writes.
+        step_offsets: ``[3, num_steps]`` from :func:`draft_step_offsets`,
+            built for the same ``lanes``.
+        lanes: rows each request drafts per step (1 for a chain, K for a tree).
+
+    Returns:
+        ``positions`` ``[num_steps, bs * lanes]`` (each lane at its request's
+        position), ``seq_lens`` ``[num_steps, bs]`` and ``slot_starts``
+        ``[num_steps, bs]`` (the first of the request's ``lanes`` write slots);
+        row ``j`` belongs to the loop's ``j``-th step.
+    """
+    positions, seq_lens, slot_starts = (
+        cache_start.unsqueeze(0) + step_offsets[:, :, None]
+    ).unbind(0)
+    if lanes > 1:
+        positions = positions.repeat_interleave(lanes, dim=1)
+    return positions, seq_lens, slot_starts
+
+
 @dataclass(frozen=True)
 class AcceptedPrefixPublisher:
     """Eagle's :class:`DraftNarrowing` for the step-0 forward.
@@ -263,6 +301,9 @@ class Eagle(HiddenStateDrafter):
         self.tree_lanes: TreeDraftInputs | None = None
         # Rows each request drafts per step: 1 for a chain, K for a draft tree.
         self.lanes_per_request = 1
+        # Per-step offsets of the decode steps' positions, lengths and write
+        # windows (draft_step_offsets); rebuilt when tree lanes bind.
+        self._step_offsets = draft_step_offsets(spec_num_steps, 1, self.device)
         # Step 0's lane ancestor masks, lane r seeing only its own slot.
         self._tree_seed_lane_mask: torch.Tensor | None = None
         # Width of the full draft vocabulary the tree ranks (bind_tree).
@@ -326,6 +367,9 @@ class Eagle(HiddenStateDrafter):
         self.tree_lanes = self._make_tree_lanes(config, max_bs)
         self.attn_backend.bind_tree_draft(self.tree_lanes)
         self.lanes_per_request = config.topk
+        self._step_offsets = draft_step_offsets(
+            self.spec_num_steps, config.topk, self.device
+        )
         self._tree_seed_lane_mask = torch.ones(
             config.topk, dtype=torch.int64, device=self.device
         ) << torch.arange(config.topk, device=self.device)
@@ -602,13 +646,13 @@ class Eagle(HiddenStateDrafter):
         # prefix, not the rejected tail.
         cache_start = frontier if first_step == 1 else frontier - 1
 
-        # +1 is the kernel's read-inclusive convention; advanced per iter.
-        draft_seq_lens = self.draft_seq_lens_buf[:bs]
-        torch.add(cache_start, 1, out=draft_seq_lens)
-
-        positions = cache_start.repeat_interleave(lanes)
-        # Step i's write window: a chain's one advancing slot, or K lane slots per request.
-        slot_starts = positions if self.tree_lanes is None else cache_start.clone()
+        # Row i - first_step holds step i's positions, read lengths and write
+        # window: a chain's one advancing slot, or K lane slots per request.
+        step_positions, step_seq_lens, step_slot_starts = draft_step_inputs(
+            cache_start,
+            self._step_offsets[:, : self.spec_num_steps - first_step],
+            lanes,
+        )
 
         history_pool_indices = None
         if self.draft_reads_token_history:
@@ -624,6 +668,9 @@ class Eagle(HiddenStateDrafter):
             self.decode_overlap.record_prefix()
 
         for i in range(first_step, self.spec_num_steps):
+            step = i - first_step
+            positions = step_positions[step]
+            draft_seq_lens = step_seq_lens[step]
             # make a ctx every time model runner forward
             # Multi-step decode is pure DECODE mode: one token per request.
             # global_num_tokens must reflect each rank's batch size, not the
@@ -651,13 +698,19 @@ class Eagle(HiddenStateDrafter):
                 all_decode_or_idle=all_decode_or_idle,
             )
 
-            def publish_step(topk: DsaTopKState = dsa_topk) -> None:
+            # Defaults bind this step's tensors: run_eager re-runs the closure
+            # on graph replay, after the loop variables have moved on.
+            def publish_step(
+                topk: DsaTopKState = dsa_topk,
+                seq_lens: torch.Tensor = draft_seq_lens,
+                slot_starts: torch.Tensor = step_slot_starts[step],
+            ) -> None:
                 self._attach_dsa_topk(topk)
                 if self.tree_lanes is None:
                     # Keep attention metadata on the accepted prefix; rejected
                     # verify tail slots may still contain stale draft KV.
                     _advance_draft_forward_metadata_if_supported(
-                        self.attn_backend, draft_seq_lens
+                        self.attn_backend, seq_lens
                     )
                 else:
                     # Tree lanes attend over the accepted prefix and their
@@ -720,11 +773,6 @@ class Eagle(HiddenStateDrafter):
                     hidden = logits_output.hidden_states
                 else:
                     draft_ids, hidden = self._expand_tree_lanes(bs, i, logits_output)
-                if i + 1 < self.spec_num_steps:
-                    positions.add_(1)
-                    draft_seq_lens.add_(1)
-                    if self.tree_lanes is not None:
-                        slot_starts.add_(lanes)
 
     def _seed_tree_lanes(
         self,

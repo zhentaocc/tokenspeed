@@ -1,7 +1,7 @@
 """Draft seq_lens must stay visible to the backend now that it owns the buffer.
 
-The drafter edits ``draft_seq_lens_buf`` in place inside the captured graph --
-``add_(1)`` per multi-step iteration -- and publishes the accepted frontier
+The drafter computes every multi-step iteration's seq_lens up front inside the
+captured graph (``draft_step_inputs``) and publishes the accepted frontier
 for step 0 through ``AcceptedPrefixPublisher`` (the ``ctx.draft_narrowing``
 handle the draft model fires when it switches to its live rows). Backends read
 their own buffer, so both must land via ``advance_draft_forward_metadata`` or
@@ -518,6 +518,47 @@ def test_draft_narrowing_is_the_only_step0_flag_on_forward_context():
     names = {f.name for f in fields(ForwardContext)}
     assert "draft_narrowing" in names
     assert not {"accept_lengths", "draft_seq_lens_buf"} & names
+
+
+@pytest.mark.parametrize("lanes", [1, 3])
+def test_draft_step_inputs_advance_one_position_per_step(lanes):
+    """Step j of the loop writes cache_start + j (every lane of a request at
+    the same position), reads cache_start + j + 1 keys and writes its
+    ``lanes`` slots right after step j - 1's."""
+    from tokenspeed.runtime.execution.drafter.eagle import (
+        draft_step_inputs,
+        draft_step_offsets,
+    )
+
+    cache_start = torch.tensor([7, 100, 31], dtype=torch.int32)
+    num_steps = 4
+    positions, seq_lens, slot_starts = draft_step_inputs(
+        cache_start, draft_step_offsets(num_steps, lanes, "cpu"), lanes
+    )
+
+    for j in range(num_steps):
+        assert positions[j].tolist() == [
+            s + j for s in cache_start.tolist() for _ in range(lanes)
+        ]
+        assert seq_lens[j].tolist() == [s + j + 1 for s in cache_start.tolist()]
+        assert slot_starts[j].tolist() == [s + j * lanes for s in cache_start.tolist()]
+    assert positions.dtype == seq_lens.dtype == slot_starts.dtype == torch.int32
+
+
+def test_draft_step_inputs_on_a_shorter_loop_keep_the_first_steps():
+    """A loop that starts at step 0 (the extend round) runs one step more
+    than one starting at step 1; slicing the offsets keeps the same rows."""
+    from tokenspeed.runtime.execution.drafter.eagle import (
+        draft_step_inputs,
+        draft_step_offsets,
+    )
+
+    cache_start = torch.tensor([12, 40], dtype=torch.int32)
+    offsets = draft_step_offsets(5, 2, "cpu")
+    full = draft_step_inputs(cache_start, offsets, 2)
+    short = draft_step_inputs(cache_start, offsets[:, :4], 2)
+    for got, want in zip(short, full):
+        assert torch.equal(got, want[:4])
 
 
 if __name__ == "__main__":
