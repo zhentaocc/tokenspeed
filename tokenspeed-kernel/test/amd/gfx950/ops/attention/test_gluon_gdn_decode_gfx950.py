@@ -149,14 +149,22 @@ def test_decode_and_verify_compile_once_across_batch_sizes():
             run(batch)
 
 
-def _pending_case(batch: int, tokens: int, capacity: int, seed: int = 0):
-    """Two payload banks, metadata codes and an FP32 pool, as GdnPendingState keeps."""
+def _pending_case(
+    batch: int,
+    tokens: int,
+    capacity: int,
+    seed: int = 0,
+    state_dtype: torch.dtype = torch.float32,
+):
+    """Two payload banks, metadata codes and a state pool, as GdnPendingState keeps."""
     gen = torch.Generator(device=DEVICE).manual_seed(seed + 1)
     width = H * D + HV * D + 2 * HV
     payload = torch.randn(
         2, 1, capacity * tokens, width, device=DEVICE, generator=gen
     ).bfloat16()
-    pool = torch.randn(3 * capacity + 1, HV, D, D, device=DEVICE, generator=gen) * 0.05
+    pool = (
+        torch.randn(3 * capacity + 1, HV, D, D, device=DEVICE, generator=gen) * 0.05
+    ).to(state_dtype)
     reads = torch.randperm(3 * capacity, device=DEVICE, generator=gen)[:batch].int() + 1
     if batch > 1:
         reads[-1] = 0  # padding row: null page, never replayed
@@ -226,18 +234,21 @@ def _commit_then_verify(pending, pool, reads, q, k, v, a, b, A_log, dt_bias):
     )  # fmt: skip
 
 
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("tokens", [4, 8])
 @pytest.mark.parametrize("batch", [1, 7, 32])
-def test_pending_replay_matches_commit_then_verify(batch, tokens):
+def test_pending_replay_matches_commit_then_verify(batch, tokens, state_dtype):
     """Fused prefix replay equals gdn_replay_commit followed by plain verify."""
     assert gdn_pending_replay_supported(
         torch.bfloat16,
         geometry=(H, HV, D, D),
-        state_dtype=torch.float32,
+        state_dtype=state_dtype,
         verify_tokens=tokens,
     )
     q, k, v, a, b, A_log, dt_bias = _packed_inputs(batch, tokens)
-    pending, pool, reads = _pending_case(batch, tokens, capacity=batch + 3)
+    pending, pool, reads = _pending_case(
+        batch, tokens, capacity=batch + 3, state_dtype=state_dtype
+    )
     expected_pool = pool.clone()
     expected = _commit_then_verify(
         pending, expected_pool, reads, q, k, v, a, b, A_log, dt_bias
@@ -247,7 +258,13 @@ def test_pending_replay_matches_commit_then_verify(batch, tokens):
         initial_state=pool, initial_state_indices=reads,
         disable_state_update=True, tree_ancestors=None, pending_replay=pending,
     )  # fmt: skip
-    torch.testing.assert_close(pool, expected_pool, rtol=1e-4, atol=2e-5)
+    if state_dtype == torch.float32:
+        torch.testing.assert_close(pool, expected_pool, rtol=1e-4, atol=2e-5)
+    else:
+        # Both paths replay in FP32 registers and round once to BF16.
+        torch.testing.assert_close(
+            pool.float(), expected_pool.float(), rtol=1.6e-2, atol=1e-3
+        )
     torch.testing.assert_close(out, expected, rtol=2e-2, atol=1e-2)
 
 
