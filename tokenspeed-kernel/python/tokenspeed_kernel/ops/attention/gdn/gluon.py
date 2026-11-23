@@ -33,6 +33,7 @@ from tokenspeed_kernel.signature import format_signatures
 
 if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.attention.gdn.decode import (
+        GluonGdnPendingPrefix,
         launch_gluon_gdn_decode_gfx950,
     )
 
@@ -93,6 +94,7 @@ if current_platform().is_amd:
             ),
             step_states=None,
             step_indices=None,
+            pending=None,
             scale=q.shape[-1] ** -0.5 if scale is None else scale,
             use_qk_l2norm=use_qk_l2norm,
         )
@@ -114,6 +116,7 @@ if current_platform().is_amd:
             "separate_output_state": frozenset({False, True}),
             "strided_qkv": frozenset({False, True}),
             "strided_state": frozenset({False, True}),
+            "pending_replay": frozenset({False, True}),
         },
     )
     def gluon_gdn_decode_mtp_gfx950(
@@ -135,10 +138,27 @@ if current_platform().is_amd:
         output_state: torch.Tensor | None,
         tree_ancestors: torch.Tensor | None,
         replay_payload: torch.Tensor | None,
+        pending_replay=None,
     ) -> torch.Tensor:
-        """gfx950 chain ``gdn_decode_mtp`` (draft trees run the Triton kernel)."""
+        """gfx950 chain ``gdn_decode_mtp`` (draft trees run the Triton kernel).
+
+        With ``pending_replay``, each request first replays its previous
+        accepted prefix (FP32 or BF16 state) and writes it back to its read
+        row; the current tokens then produce outputs only.
+        """
         if tree_ancestors is not None or replay_payload is not None:
             raise NotImplementedError("the gfx950 GDN verify kernel follows a chain")
+        pending = None
+        if pending_replay is not None:
+            if not disable_state_update or output_state_indices is not None:
+                raise ValueError("pending replay requires output-only verify")
+            layer = pending_replay.layer
+            pending = GluonGdnPendingPrefix(
+                payload=pending_replay.payload[:, layer],
+                rows=pending_replay.rows,
+                steps=pending_replay.steps,
+                pages=pending_replay.pages[:, layer],
+            )
         # Per-token rows (in output_state, default the pool itself) or the
         # dense intermediate buffer; the read row takes the final state only
         # when neither applies and the update is enabled.
@@ -161,6 +181,7 @@ if current_platform().is_amd:
             final_indices=initial_state_indices if write_back else None,
             step_states=step_states,
             step_indices=output_state_indices,
+            pending=pending,
             scale=q.shape[-1] ** -0.5 if scale is None else scale,
             use_qk_l2norm=use_qk_l2norm,
         )

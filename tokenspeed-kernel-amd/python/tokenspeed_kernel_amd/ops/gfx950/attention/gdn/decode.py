@@ -22,6 +22,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
 
@@ -50,7 +52,13 @@ def _gdn_decode_launch_metadata(grid, kernel, args):
     batch, tokens = q.shape[0], args["T"]
     heads, value_dim, key_dim = args["HV"], args["V"], args["K"]
     state_bytes = heads * value_dim * key_dim * args["state_in"].element_size()
-    writes = (tokens if args["STEP_MODE"] else 0) + int(args["WRITE_FINAL"])
+    # A pending prefix adds an unknown (device-side) replay and one write-back;
+    # count the write-back as the upper bound.
+    writes = (
+        (tokens if args["STEP_MODE"] else 0)
+        + int(args["WRITE_FINAL"])
+        + int(args["PENDING"])
+    )
     activations = (
         2 * batch * tokens * args["H"] * key_dim * q.element_size()
         + 2 * batch * tokens * heads * value_dim * v.element_size()
@@ -74,7 +82,15 @@ def _gdn_decode_store_state(state, pool, row, row_stride, head_offset, tile_offs
     )
 
 
-@gluon.jit(launch_metadata=_gdn_decode_launch_metadata, do_not_specialize=("T",))
+@gluon.jit(
+    launch_metadata=_gdn_decode_launch_metadata,
+    do_not_specialize=(
+        "T",
+        "pending_capacity",
+        "pending_bank_stride",
+        "pending_page_bank_stride",
+    ),
+)
 def gluon_gdn_decode_gfx950(
     q,
     k,
@@ -89,6 +105,13 @@ def gluon_gdn_decode_gfx950(
     final_indices,
     step_states,
     step_indices,
+    pending_payload,
+    pending_rows,
+    pending_steps,
+    pending_pages,
+    pending_capacity,
+    pending_bank_stride,
+    pending_page_bank_stride,
     scale,
     T,
     q_batch_stride,
@@ -115,6 +138,7 @@ def gluon_gdn_decode_gfx950(
     STEP_MODE: gl.constexpr,
     WRITE_FINAL: gl.constexpr,
     USE_QK_L2NORM: gl.constexpr,
+    PENDING: gl.constexpr,
     T_BLOCK: gl.constexpr,
 ):
     """Sigmoid-gated delta-rule recurrence of T tokens for one V block of one head.
@@ -125,6 +149,14 @@ def gluon_gdn_decode_gfx950(
     ``read_indices[n]`` (negative: zero state), writes each token's state per
     STEP_MODE and, with WRITE_FINAL, the last state to ``state_in`` row
     ``final_indices[n]``; negative destination rows are skipped.
+
+    With PENDING, the read row may still lack the previous round's accepted
+    prefix. ``pending_rows[n]`` names its bank/row code (negative: none) in
+    the two payload banks ``pending_payload`` (this layer's ``[2, C*T,
+    width]`` view, raw ``[k | v | a | b]`` rows). When the code's recorded
+    page ``pending_pages`` equals the read row, the first
+    ``pending_steps[code]`` tokens are replayed onto the state, which is
+    written back to the read row before the current tokens run.
 
     Each lane holds a ``[ROWS_PER_THREAD, 16]`` patch of the ``[BV, K]`` tile
     (four 4-wide K runs, 32 apart), so a reduction over K is 16 in-register
@@ -149,6 +181,10 @@ def gluon_gdn_decode_gfx950(
     head_offset = head_v * (V * K)
 
     read_idx = gl.load(read_indices + seq).to(gl.int64)
+    if PENDING:
+        # Issued before the state load so the replay metadata and payload
+        # loads overlap it (loads retire in order on CDNA).
+        code = gl.load(pending_rows + seq)
     state = cdna4.buffer_load(
         state_in + gl.maximum(read_idx, 0) * state_in_row_stride + head_offset,
         tile_offsets,
@@ -185,6 +221,70 @@ def gluon_gdn_decode_gfx950(
     neg_a = -gl.exp(gl.load(A_log + head_v).to(gl.float32))
     bias = gl.load(dt_bias + head_v).to(gl.float32)
     zeros_v = gl.zeros([T_BLOCK, BV], gl.float32, layout=token_value_layout)
+
+    if PENDING:
+        # Finish the previous round's accepted prefix first, as
+        # gdn_replay_commit would: raw payload keys are always L2-normalized.
+        width: gl.constexpr = H * K + HV * V + 2 * HV
+        live = (code >= 0) & (read_idx > 0)
+        code = gl.maximum(code, 0)
+        pending_bank = code // pending_capacity
+        pending_row = code - pending_bank * pending_capacity
+        page = gl.load(
+            pending_pages
+            + pending_bank.to(gl.int64) * pending_page_bank_stride
+            + pending_row,
+            mask=live,
+            other=-1,
+        ).to(gl.int64)
+        # Independent of the page load: both need only the code.
+        steps = gl.load(pending_steps + code, mask=live, other=0)
+        replay = (
+            pending_payload
+            + pending_bank.to(gl.int64) * pending_bank_stride
+            + pending_row.to(gl.int64) * T * width
+        )
+        accepted = gl.where(page == read_idx, gl.minimum(gl.maximum(steps, 0), T), 0)
+        # The payload loads need only the row code, not the accepted length:
+        # they overlap the page and length round trips.
+        for t0 in range(0, T, T_BLOCK):
+            tokens = t0 + gl.arange(0, T_BLOCK, layout=gl.SliceLayout(1, token_layout))
+            k_all = cdna4.buffer_load(
+                replay,
+                head_k * K + tokens[:, None] * width + keys[None, :],
+                mask=((tokens < T) & live)[:, None] & (keys >= 0)[None, :],
+                other=0.0,
+            ).to(gl.float32)
+            k_all = k_all * gl.rsqrt(gl.sum(k_all * k_all, axis=1) + 1e-6)[:, None]
+            v_tokens = t0 + gl.arange(
+                0, T_BLOCK, layout=gl.SliceLayout(1, token_value_layout)
+            )
+            v_live = (v_tokens < T) & live
+            v_all = cdna4.buffer_load(
+                replay,
+                H * K + head_v * V + v_tokens[:, None] * width + v_rows[None, :],
+                mask=v_live[:, None] & (v_rows >= 0)[None, :],
+                other=0.0,
+            ).to(gl.float32)
+            gates = replay + H * K + HV * V + head_v + v_tokens * width
+            a_all = gl.load(gates, mask=v_live, other=0.0).to(gl.float32)
+            b_all = gl.load(gates + HV, mask=v_live, other=0.0).to(gl.float32)
+            x = a_all + bias
+            softplus = gl.where(x <= 20.0, gl.log(1.0 + gl.exp(x)), x)
+            beta_all = 1.0 / (1.0 + gl.exp(-b_all))
+            smem_k.store(k_all)
+            smem_v.store(v_all * beta_all[:, None])
+            smem_beta.store(zeros_v + beta_all[:, None])
+            smem_decay.store(zeros_v + gl.exp(neg_a * softplus)[:, None])
+            for t in range(t0, gl.minimum(t0 + T_BLOCK, accepted)):
+                slot = t - t0
+                k_t = rows_k.index(slot).load(key_layout)
+                beta_v = rows_v.index(slot).load(row_layout)
+                beta = rows_beta.index(slot).load(row_layout)
+                decay = rows_decay.index(slot).load(row_layout)
+                state = state * decay[:, None]
+                prediction = gl.sum(state * k_t[None, :], axis=1)
+                state = state + (beta_v - beta * prediction)[:, None] * k_t[None, :]
 
     o_row = o + (seq * T * HV + head_v) * V
     for t0 in range(0, T, T_BLOCK):
@@ -250,6 +350,19 @@ def gluon_gdn_decode_gfx950(
         # reads them in the state's row layout.
         smem_beta.store(zeros_v + beta_all[:, None])
         smem_decay.store(zeros_v + gl.exp(neg_a * softplus)[:, None])
+        if PENDING:
+            if t0 == 0:
+                # Write the replayed state back once the first chunk's loads
+                # have landed: CDNA stores share the in-order load counter,
+                # so an earlier store would stall those loads.
+                _gdn_decode_store_state(
+                    state,
+                    state_in,
+                    gl.where(accepted > 0, read_idx, -1),
+                    state_in_row_stride,
+                    head_offset,
+                    tile_offsets,
+                )
 
         for t in range(t0, gl.minimum(t0 + T_BLOCK, T)):
             slot = t - t0
@@ -286,6 +399,55 @@ def gluon_gdn_decode_gfx950(
         )
 
 
+@dataclass(frozen=True)
+class GluonGdnPendingPrefix:
+    """One layer's previous accepted prefixes, kept in two batch banks.
+
+    ``payload`` is this layer's ``[2, C * T, H*K + HV*V + 2*HV]`` view of the
+    banks (raw ``k | v | a | b`` per token, unit last stride). ``rows`` maps
+    each current request to its bank/row code ``bank * C + row`` (negative:
+    none). ``steps`` ``[2, C]`` holds accepted token counts and ``pages``
+    ``[2, C]`` the state row each prefix belongs to; a prefix is replayed only
+    when that row is the request's read row. All metadata is device int32.
+    """
+
+    payload: torch.Tensor
+    rows: torch.Tensor
+    steps: torch.Tensor
+    pages: torch.Tensor
+
+
+def _check_pending_prefix(pending, q, v):
+    batch, tokens, heads, key_dim = q.shape
+    value_heads, value_dim = v.shape[2], v.shape[3]
+    payload, rows, steps, pages = (
+        pending.payload,
+        pending.rows,
+        pending.steps,
+        pending.pages,
+    )
+    capacity = steps.shape[1] if steps.ndim == 2 else 0
+    width = heads * key_dim + value_heads * value_dim + 2 * value_heads
+    if (
+        payload.ndim != 3
+        or payload.shape[0] != 2
+        or payload.shape[1:] != (capacity * tokens, width)
+        or payload.stride(-1) != 1
+        or payload.stride(1) != width
+        or steps.shape != (2, capacity)
+        or not steps.is_contiguous()
+        or pages.shape != (2, capacity)
+        or pages.stride(1) != 1
+        or rows.shape != (batch,)
+        or batch > capacity
+        or any(t.dtype != torch.int32 for t in (rows, steps, pages))
+    ):
+        raise ValueError(
+            "pending prefixes need [2, C*T, width] payload banks and int32 "
+            "[B] rows, [2, C] steps and pages"
+        )
+
+
 def launch_gluon_gdn_decode_gfx950(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -300,6 +462,7 @@ def launch_gluon_gdn_decode_gfx950(
     final_indices: torch.Tensor | None,
     step_states: torch.Tensor | None,
     step_indices: torch.Tensor | None,
+    pending: GluonGdnPendingPrefix | None,
     scale: float,
     use_qk_l2norm: bool,
 ) -> torch.Tensor:
@@ -318,6 +481,9 @@ def launch_gluon_gdn_decode_gfx950(
         step_states: K-last pool receiving every token's state, or ``None``.
         step_indices: int32 ``[B, T]`` rows of ``step_states``; ``None`` with
             ``step_states`` writes the dense row ``n * T + t``.
+        pending: Previous accepted prefixes replayed onto the read rows and
+            written back to them before the current tokens, or ``None`` when
+            the read rows hold committed state.
         scale: Query scale applied after the optional L2 norm.
         use_qk_l2norm: Whether to L2-normalize q and k over K.
 
@@ -347,6 +513,22 @@ def launch_gluon_gdn_decode_gfx950(
     if batch == 0:
         return out
 
+    if pending is not None:
+        if final_indices is not None or step_states is not None:
+            raise ValueError("pending prefixes are replayed only by output-only verify")
+        _check_pending_prefix(pending, q, v)
+        pending_args = (
+            pending.payload,
+            pending.rows,
+            pending.steps,
+            pending.pages,
+            pending.steps.shape[1],
+            pending.payload.stride(0),
+            pending.pages.stride(0),
+        )
+    else:
+        pending_args = (q, read_indices, read_indices, read_indices, 1, 0, 0)
+
     step_mode = GDN_DECODE_STEPS_NONE
     if step_states is not None:
         step_mode = (
@@ -366,6 +548,7 @@ def launch_gluon_gdn_decode_gfx950(
         read_indices if final_indices is None else final_indices,
         state if step_states is None else step_states,
         read_indices if step_indices is None else step_indices,
+        *pending_args,
         scale,
         tokens,
         q.stride(0),
@@ -392,6 +575,7 @@ def launch_gluon_gdn_decode_gfx950(
         STEP_MODE=step_mode,
         WRITE_FINAL=final_indices is not None,
         USE_QK_L2NORM=use_qk_l2norm,
+        PENDING=pending is not None,
         # LDS staging chunk, bucketed so a server's fixed T compiles once.
         T_BLOCK=min(triton.next_power_of_2(tokens), 16),
         num_warps=_NUM_WARPS,

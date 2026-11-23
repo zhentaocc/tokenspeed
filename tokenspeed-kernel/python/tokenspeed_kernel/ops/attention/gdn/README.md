@@ -335,5 +335,15 @@ streaming requests after running requests, queued requests and active
 KV pages from warmup drain. Pass the engine's metrics endpoint through
 `--metrics-url` and use identical prefill capture settings for both runs.
 
+On gfx950, the Gluon chain verify (`gluon_gdn_decode_mtp_gfx950`) takes
+the same descriptor for any chain length and for FP32 or BF16 state. Each
+program replays its `[16, K]` state tile through the accepted prefix of the
+request's previous bank row, staged in LDS like the verify tokens. It
+writes the tile back to the read row, then runs the output-only verify from
+registers. A row is replayed only when its recorded page equals the read
+row, as `gdn_replay_commit` would replay it. The kernel L2-normalizes the
+raw payload keys like that commit. Batch size, bank capacity and accepted
+lengths are runtime values.
+
 See the [runtime contract](../../../../../../docs/design/unified_path.md#deferred-gdn-accepted-state)
 for state ownership and the boundaries that require materialization.

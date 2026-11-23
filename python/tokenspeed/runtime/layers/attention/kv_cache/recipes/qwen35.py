@@ -382,7 +382,6 @@ class QwenGDNRecipe(CacheRecipe):
             and not self.server_args.decode_monokernel
             and self.server_args.pipeline_parallel_size == 1
             and not self.draft_tree
-            and int(self.server_args.speculative_num_draft_tokens) == 4
         ):
             from tokenspeed_kernel.ops.attention.gdn import gdn_pending_replay_supported
 
@@ -397,6 +396,7 @@ class QwenGDNRecipe(CacheRecipe):
                 state_dtype={"bfloat16": torch.bfloat16, "float32": torch.float32}[
                     state_dtype
                 ],
+                verify_tokens=int(self.server_args.speculative_num_draft_tokens),
             ):
                 # The second payload bank is batch-sized; only ownership
                 # records are indexed by the whole request pool.

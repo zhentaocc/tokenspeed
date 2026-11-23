@@ -1851,6 +1851,14 @@ K-last recurrent-state pool. Draft trees stay on the Triton kernel.
   back to the read row only when neither applies and updates are enabled.
 - `T` and the batch are runtime values. The kernel stages tokens in LDS in
   chunks of `min(next_power_of_2(T), 16)`, the only T-derived constexpr.
+- With a pending prefix (`GluonGdnPendingPrefix`, from `pending_replay` of
+  output-only chain verify), the read row may still lack the previous
+  round's accepted tokens. A request's bank/row code selects raw
+  `[k | v | a | b]` payload rows. When the code's recorded page is the read
+  row, the kernel first replays `steps[code]` tokens (clamped to T) onto the
+  tile, with L2-normalized keys like `gdn_replay_commit`. It writes the tile
+  back to the read row and then runs the verify. Bank capacity and accepted
+  lengths are runtime values.
 
 #### Algorithm
 

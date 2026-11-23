@@ -4684,7 +4684,8 @@ class ServerArgs:
             "--enable-deferred-gdn-state",
             action="store_true",
             default=ServerArgs.enable_deferred_gdn_state,
-            help="Defer accepted GDN recurrent replay to the next layer's WY (BF16 T4 chains).",
+            help="Defer accepted GDN recurrent replay into the next round's verify "
+            "kernel (NVIDIA BF16 T4 chains; gfx950 BF16/FP32-state chains).",
         )
         parser.add_argument(
             "--disable-replay-ssm",

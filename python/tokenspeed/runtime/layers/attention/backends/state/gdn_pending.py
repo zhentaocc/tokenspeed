@@ -62,13 +62,17 @@ class GdnPendingState:
         *,
         slot_count: int,
         geometry: tuple[int, int, int, int],
+        draft_token_num: int,
+        state_dtype: torch.dtype,
         state_addresses: torch.Tensor,
         state_row_strides: torch.Tensor,
         rows_aligned: bool,
         group_indices: torch.Tensor,
     ):
         layers, tokens, width = payload.shape
-        self.capacity = tokens // 4
+        self.capacity = tokens // draft_token_num
+        self.draft_token_num = draft_token_num
+        self.state_dtype = state_dtype
         self.geometry = geometry
         self.parameters = parameters
         self.state_addresses = state_addresses
@@ -166,9 +170,9 @@ class GdnPendingState:
             accepted_length=self.steps[0],
             request_mask=None,
             selected_requests=None,
-            draft_token_num=4,
+            draft_token_num=self.draft_token_num,
             geometry=self.geometry,
-            state_dtype=torch.bfloat16,
+            state_dtype=self.state_dtype,
             rows_aligned=self.rows_aligned,
         )
 
@@ -222,9 +226,9 @@ class GdnPendingState:
                 request_workspace=(
                     self.request_workspaces[bank] if selection is not None else None
                 ),
-                draft_token_num=4,
+                draft_token_num=self.draft_token_num,
                 geometry=self.geometry,
-                state_dtype=torch.bfloat16,
+                state_dtype=self.state_dtype,
                 rows_aligned=self.rows_aligned,
             )
 

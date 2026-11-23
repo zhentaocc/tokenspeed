@@ -236,6 +236,7 @@ if _AVAILABLE:
             "tree": frozenset({False}),
             "varlen": frozenset({False}),
             "pending_replay": frozenset({True}),
+            "state_dtype": frozenset({torch.bfloat16}),
             "strided_qkv": frozenset({True, False}),
         },
     )

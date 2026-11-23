@@ -910,6 +910,8 @@ def _gdn_pending():
         torch.zeros(2, 2, 2),
         slot_count=POOL_ROWS,
         geometry=(1, 2, 128, 128),
+        draft_token_num=4,
+        state_dtype=torch.bfloat16,
         state_addresses=torch.zeros(2, dtype=torch.uint64),
         state_row_strides=torch.full((2,), 2 * 128 * 128, dtype=torch.int64),
         rows_aligned=True,

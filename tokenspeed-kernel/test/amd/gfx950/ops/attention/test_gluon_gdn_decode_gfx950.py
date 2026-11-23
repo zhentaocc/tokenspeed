@@ -33,8 +33,11 @@ if not is_cdna4():
     pytest.skip("AMD CDNA4 is required", allow_module_level=True)
 
 from tokenspeed_kernel.ops.attention.gdn import (  # noqa: E402
+    GdnPendingReplay,
     gdn_decode_mtp,
     gdn_decode_step,
+    gdn_pending_replay_supported,
+    gdn_replay_commit,
 )
 from tokenspeed_kernel_amd.ops.gfx950.attention.gdn.decode import (  # noqa: E402
     gluon_gdn_decode_gfx950,
@@ -143,4 +146,125 @@ def test_decode_and_verify_compile_once_across_batch_sizes():
     run(16)
     with assert_no_triton_compile(gluon_gdn_decode_gfx950):
         for batch in (2, 3, 5, 8, 13, 17):
+            run(batch)
+
+
+def _pending_case(batch: int, tokens: int, capacity: int, seed: int = 0):
+    """Two payload banks, metadata codes and an FP32 pool, as GdnPendingState keeps."""
+    gen = torch.Generator(device=DEVICE).manual_seed(seed + 1)
+    width = H * D + HV * D + 2 * HV
+    payload = torch.randn(
+        2, 1, capacity * tokens, width, device=DEVICE, generator=gen
+    ).bfloat16()
+    pool = torch.randn(3 * capacity + 1, HV, D, D, device=DEVICE, generator=gen) * 0.05
+    reads = torch.randperm(3 * capacity, device=DEVICE, generator=gen)[:batch].int() + 1
+    if batch > 1:
+        reads[-1] = 0  # padding row: null page, never replayed
+    banks = torch.arange(batch, device=DEVICE) % 2
+    rows = (banks * capacity + torch.arange(batch, device=DEVICE)).int()
+    rows[1::5] = -1  # committed state: nothing pending
+    steps = torch.randint(
+        0, tokens + 1, (2, capacity), device=DEVICE, dtype=torch.int32, generator=gen
+    )
+    steps[1, 3] = tokens + 3  # clamped to T, like the runtime's acceptance
+    pages = torch.full((2, 1, capacity), -1, device=DEVICE, dtype=torch.int32)
+    for n in range(batch):
+        pages[n % 2, 0, n] = reads[n]
+    if batch > 2:
+        pages[0, 0, 2] = reads[2] + 1  # stale page: skip
+    pending = GdnPendingReplay(
+        payload,
+        0,
+        rows,
+        steps,
+        pages,
+        torch.zeros(1, device=DEVICE, dtype=torch.int32),
+    )
+    return pending, pool, reads
+
+
+def _commit_then_verify(pending, pool, reads, q, k, v, a, b, A_log, dt_bias):
+    """The unfused path: replay-commit the live prefixes, then output-only verify."""
+    batch, tokens = q.shape[:2]
+    capacity = pending.steps.shape[1]
+    parameters = torch.stack((A_log, dt_bias))[None].float()
+    for bank in range(2):
+        accepted = torch.zeros(capacity, device=DEVICE, dtype=torch.int32)
+        pages = torch.full((1, capacity), -1, device=DEVICE, dtype=torch.int32)
+        for n in range(batch):
+            code = int(pending.rows[n])
+            if code < 0 or code // capacity != bank or int(reads[n]) <= 0:
+                continue
+            row = code % capacity
+            if int(pending.pages[bank, 0, row]) != int(reads[n]):
+                continue
+            accepted[row] = pending.steps[bank, row].clamp(0, tokens)
+            pages[0, row] = reads[n]
+        gdn_replay_commit(
+            pending.payload[bank],
+            parameters,
+            state_addresses=torch.tensor(
+                [pool.data_ptr()], device=DEVICE, dtype=torch.uint64
+            ),
+            state_row_strides=torch.tensor(
+                [pool.stride(0)], device=DEVICE, dtype=torch.int64
+            ),
+            read_indices=pages,
+            write_indices=pages,
+            accepted_length=accepted,
+            request_mask=None,
+            selected_requests=None,
+            draft_token_num=tokens,
+            geometry=(H, HV, D, D),
+            state_dtype=pool.dtype,
+            rows_aligned=True,
+        )
+    return gdn_decode_mtp(
+        q=q, k=k, v=v, a=a, b=b, A_log=A_log, dt_bias=dt_bias,
+        initial_state=pool, initial_state_indices=reads,
+        disable_state_update=True, tree_ancestors=None, pending_replay=None,
+    )  # fmt: skip
+
+
+@pytest.mark.parametrize("tokens", [4, 8])
+@pytest.mark.parametrize("batch", [1, 7, 32])
+def test_pending_replay_matches_commit_then_verify(batch, tokens):
+    """Fused prefix replay equals gdn_replay_commit followed by plain verify."""
+    assert gdn_pending_replay_supported(
+        torch.bfloat16,
+        geometry=(H, HV, D, D),
+        state_dtype=torch.float32,
+        verify_tokens=tokens,
+    )
+    q, k, v, a, b, A_log, dt_bias = _packed_inputs(batch, tokens)
+    pending, pool, reads = _pending_case(batch, tokens, capacity=batch + 3)
+    expected_pool = pool.clone()
+    expected = _commit_then_verify(
+        pending, expected_pool, reads, q, k, v, a, b, A_log, dt_bias
+    )
+    out = gdn_decode_mtp(
+        q=q, k=k, v=v, a=a, b=b, A_log=A_log, dt_bias=dt_bias,
+        initial_state=pool, initial_state_indices=reads,
+        disable_state_update=True, tree_ancestors=None, pending_replay=pending,
+    )  # fmt: skip
+    torch.testing.assert_close(pool, expected_pool, rtol=1e-4, atol=2e-5)
+    torch.testing.assert_close(out, expected, rtol=2e-2, atol=1e-2)
+
+
+def test_pending_replay_compiles_once_across_batch_sizes():
+    """Batch, bank capacity and accepted lengths are runtime values."""
+
+    def run(batch: int) -> None:
+        q, k, v, a, b, A_log, dt_bias = _packed_inputs(batch, 8)
+        pending, pool, reads = _pending_case(batch, 8, capacity=batch + 3)
+        gdn_decode_mtp(
+            q=q, k=k, v=v, a=a, b=b, A_log=A_log, dt_bias=dt_bias,
+            initial_state=pool, initial_state_indices=reads,
+            disable_state_update=True, tree_ancestors=None, pending_replay=pending,
+        )  # fmt: skip
+
+    run(1)
+    run(16)
+    with assert_no_triton_compile(gluon_gdn_decode_gfx950):
+        for batch in (2, 5, 13, 32):
             run(batch)

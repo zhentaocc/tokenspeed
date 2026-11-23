@@ -74,6 +74,7 @@ def pending_metadata(
     B,
     S,
     N,
+    T,
     L: tl.constexpr,
     LB: tl.constexpr,
     OP: tl.constexpr,
@@ -141,7 +142,7 @@ def pending_metadata(
         layer = tl.arange(0, LB)
         slot = tl.load(slots + row).to(tl.int64)
         live = (slot > 0) & (slot < S - 1)
-        count = tl.minimum(4, tl.maximum(0, tl.load(input_accepted + row, row < B, 0)))
+        count = tl.minimum(T, tl.maximum(0, tl.load(input_accepted + row, row < B, 0)))
         source = tl.load(reads + layer.to(tl.int64) * C + row, layer < L, -1)
         destination = tl.load(writes + layer.to(tl.int64) * C + row, layer < L, -1)
         same_pages = (

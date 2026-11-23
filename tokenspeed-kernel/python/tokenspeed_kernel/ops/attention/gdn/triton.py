@@ -2083,6 +2083,7 @@ def triton_gdn_pending_metadata(
         batch,
         slot_count,
         requested,
+        buffers["payload"].shape[2] // capacity,
         L=layers,
         LB=triton.next_power_of_2(layers),
         OP=op,

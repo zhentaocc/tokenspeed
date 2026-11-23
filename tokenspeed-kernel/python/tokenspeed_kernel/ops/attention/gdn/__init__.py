@@ -620,7 +620,8 @@ class GdnPendingReplay:
     bank/row ids (-1 for committed state). ``steps`` and ``pages`` retain the
     accepted lengths and live pages of those rows, independently of refresh.
     ``write_bank`` is a device scalar selecting the current payload destination.
-    Only BF16, K=V=128, four-token chains with in-place state are supported.
+    Chains verify ``T`` tokens with in-place state; the selected kernel's
+    ``verify_tokens`` trait and state-dtype signature bound ``T`` and dtypes.
     """
 
     payload: torch.Tensor
@@ -643,35 +644,38 @@ def _validate_pending_replay(pending, q, k, v, a, b, state, indices) -> None:
     capacity = pending.steps.shape[1]
     layers = payload.shape[1]
     if (
-        tokens != 4
-        or dim != 128
+        dim != 128
         or v.shape[-1] != 128
         or heads < 1
         or vheads < heads
         or vheads % heads
         or batch > capacity
         or not 0 <= pending.layer < layers
-        or payload.shape != (2, layers, capacity * 4, width)
+        or payload.shape != (2, layers, capacity * tokens, width)
         or pending.steps.shape != (2, capacity)
         or pending.pages.shape != (2, layers, capacity)
         or pending.rows.shape != (batch,)
         or pending.write_bank.shape != (1,)
         or k.shape != q.shape
         or v.shape[:2] != q.shape[:2]
-        or a.shape != (batch, 4, vheads)
+        or a.shape != (batch, tokens, vheads)
         or b.shape != a.shape
         or state.ndim != 4
         or state.shape[1:] != (vheads, 128, 128)
         or indices.shape != (batch,)
     ):
         raise ValueError(
-            "pending replay requires matching batch banks and BF16 H/HV K128/V128 T4 geometry"
+            "pending replay requires matching batch banks and H/HV K128/V128 geometry"
         )
-    for tensor in (payload, q, k, v, state):
+    for tensor in (payload, q, k, v):
         if tensor.dtype != torch.bfloat16 or tensor.device != q.device:
             raise ValueError(
-                "pending replay activations, payload and state must be BF16 on one device"
+                "pending replay activations and payload must be BF16 on one device"
             )
+    if state.dtype not in (torch.bfloat16, torch.float32) or state.device != q.device:
+        raise ValueError(
+            "pending replay state must be BF16 or FP32 on the query device"
+        )
     for tensor in (pending.steps, pending.pages, pending.rows, pending.write_bank):
         if (
             tensor.dtype != torch.int32
@@ -688,17 +692,22 @@ def _validate_pending_replay(pending, q, k, v, a, b, state, indices) -> None:
 
 
 def gdn_pending_replay_supported(
-    dtype: torch.dtype, *, geometry: tuple[int, int, int, int], state_dtype: torch.dtype
+    dtype: torch.dtype,
+    *,
+    geometry: tuple[int, int, int, int],
+    state_dtype: torch.dtype,
+    verify_tokens: int,
 ) -> bool:
-    """Return registry support for activation/state dtypes and (H, HV, K, V).
+    """Return registry support for dtypes, (H, HV, K, V) and chain length.
 
-    The contract is output-only four-token chain verify with in-place BF16
-    state. No payloads are allocated or device data read by this query.
+    The contract is output-only ``verify_tokens``-token chain verify with
+    in-place state. No payloads are allocated or device data read by this
+    query.
     """
     heads, vheads, _, _ = geometry
     if (
         dtype != torch.bfloat16
-        or state_dtype != torch.bfloat16
+        or state_dtype not in (torch.bfloat16, torch.float32)
         or geometry[2:] != (128, 128)
         or heads < 1
         or vheads < heads
@@ -719,7 +728,8 @@ def gdn_pending_replay_supported(
             traits={
                 "head_dim": 128,
                 "value_head_dim": 128,
-                "verify_tokens": 4,
+                "verify_tokens": verify_tokens,
+                "state_dtype": state_dtype,
                 "output_only": True,
                 "tree": False,
                 "varlen": False,
@@ -926,6 +936,8 @@ def gdn_decode_mtp(
             pending_replay, q, k, v, a, b, initial_state, initial_state_indices
         )
         extra["pending_replay"] = pending_replay
+        # Pending replay writes the accepted prefix back to the state rows.
+        traits["state_dtype"] = initial_state.dtype
     if solution != "flashinfer" and not output_only:
         # Only the legacy FlashInfer solution retains its old padding contract;
         # other named solutions must still accept the actual state dtype. A

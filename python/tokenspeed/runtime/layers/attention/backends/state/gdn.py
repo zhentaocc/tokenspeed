@@ -218,9 +218,11 @@ class GdnAttnBackend(CapacityPrefillBackend):
             or replay is None
             or self.draft_tree
             or self.is_draft
-            or draft_token_num != 4
             or not gdn_pending_replay_supported(
-                self.dtype, geometry=replay.geometry, state_dtype=replay.state_dtype
+                self.dtype,
+                geometry=replay.geometry,
+                state_dtype=replay.state_dtype,
+                verify_tokens=draft_token_num,
             )
         ):
             return
@@ -240,6 +242,8 @@ class GdnAttnBackend(CapacityPrefillBackend):
             replay.parameters,
             slot_count=self._pending_slot_count,
             geometry=replay.geometry,
+            draft_token_num=draft_token_num,
+            state_dtype=replay.state_dtype,
             state_addresses=tables["ssm_comp"],
             state_row_strides=tables["ssm_element_stride"],
             rows_aligned=tables["ssm_rows_aligned"],

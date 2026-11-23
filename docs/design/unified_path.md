@@ -2894,8 +2894,9 @@ reserved write extent. The sampled path currently requires attention TP1.
 
 ## Deferred GDN accepted state
 
-`--enable-deferred-gdn-state` opts NVIDIA BF16 K128/V128 chain T4 verify into
-accepted recurrent replay at the next layer's WY read. Convolution still
+`--enable-deferred-gdn-state` opts NVIDIA BF16 K128/V128 chain T4 verify, and
+gfx950 K128/V128 chain verify with BF16 or FP32 state at any draft length, into
+accepted recurrent replay at the next layer's verify state read. Convolution still
 commits during acceptance. Token and KV frontiers advance normally; pending
 recurrent state is a separate fact, never an artificially shortened frontier.
 
