@@ -2000,7 +2000,7 @@ class ModelExecutor:
             allow_defer=(
                 ctx.forward_mode.is_decode()
                 and ctx.num_extends == 0
-                and ctx.output_layout.decode_width == 4
+                and ctx.output_layout.decode_width == self.config.spec_num_tokens
             ),
         )
 
