@@ -162,6 +162,11 @@ def load_model_config(
             list(getattr(draft_of.hf_config, "architectures", None) or []),
             list(getattr(config.hf_config, "architectures", None) or []),
         )
+        # --draft-decode-monokernel: a draft-only switch (server args accept
+        # it only for DRAFT_DECODE_MONOKERNEL_ARCHITECTURES).
+        config.hf_text_config.draft_decode_monokernel = bool(
+            server_args.draft_decode_monokernel
+        )
     return config
 
 
