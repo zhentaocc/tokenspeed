@@ -328,6 +328,8 @@ class Envs:
     TOKENSPEED_LOG_SPEC_ACCEPT_LENGTHS = EnvBool(False)
     # Scan scheduler page-table values against the supplied page-ID bounds.
     TOKENSPEED_VALIDATE_PAGE_IDS = EnvBool(False)
+    # Debug: round every written KV row through MXFP4 (kv_cache/simulated_quant.py).
+    TOKENSPEED_SIMULATE_KV_QUANT = EnvStr(None)
     # Rank 0 logs EAGLE-Harness rounds per batch bucket and verify width every N rounds (0: off).
     TOKENSPEED_EAGLE_HARNESS_ROUND_STATS = EnvInt(0)
     TOKENSPEED_PROFILER_DIR = EnvStr("/tmp")

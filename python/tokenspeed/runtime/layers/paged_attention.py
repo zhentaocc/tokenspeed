@@ -61,6 +61,10 @@ from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.layers.attention.dcp.placement import resolve_write_slots
+from tokenspeed.runtime.layers.attention.kv_cache.simulated_quant import (
+    simulate_latent_write_,
+    simulated_kv_quant,
+)
 from tokenspeed.runtime.model_loader.weight_utils import (
     K_CACHE_SCALE_SUFFIXES,
     V_CACHE_SCALE_SUFFIXES,
@@ -559,16 +563,19 @@ class PagedAttention(nn.Module):
             None if self.rotary_emb is None else self.rotary_emb.as_rotary(positions)
         )
         if key_rows is None:
-            return mla_prologue(
+            target = self._local_target(slots, ctx)
+            out = mla_prologue(
                 query,
                 q_pe,
                 latent_cache,
                 expanded=expanded,
                 rotary=rotary,
-                cache=self._local_target(slots, ctx),
+                cache=target,
                 solution=None,
                 override=None,
             )
+            _simulate_latent_write(target, latent_cache.shape[-1] - q_pe.shape[-1])
+            return out
         if expanded is not None:
             raise ValueError(
                 "a query shard writes its latent through the absorbed prologue; "
@@ -607,11 +614,10 @@ class PagedAttention(nn.Module):
                 out.latent.contiguous(), key_rows.group, list(plan.row_counts)
             )
         )
-        latent_store(
-            gathered,
-            kv_lora_rank=out.latent.shape[-1] - q_pe.shape[-1],
-            cache=self._local_target(slots, ctx),
-        )
+        target = self._local_target(slots, ctx)
+        kv_lora_rank = out.latent.shape[-1] - q_pe.shape[-1]
+        latent_store(gathered, kv_lora_rank=kv_lora_rank, cache=target)
+        _simulate_latent_write(target, kv_lora_rank)
         return out
 
     def latent_prologue_with_rows(
@@ -688,12 +694,22 @@ class PagedAttention(nn.Module):
         gathered = plan.to_span_order(
             token_all_gather_rows(payload, key_rows.group, list(plan.row_counts))
         )
-        latent_store(
-            gathered[:, width:],
-            kv_lora_rank=out.latent.shape[-1] - q_pe.shape[-1],
-            cache=self._local_target(slots, ctx),
-        )
+        target = self._local_target(slots, ctx)
+        kv_lora_rank = out.latent.shape[-1] - q_pe.shape[-1]
+        latent_store(gathered[:, width:], kv_lora_rank=kv_lora_rank, cache=target)
+        _simulate_latent_write(target, kv_lora_rank)
         return out, gathered[:, :width].contiguous()
+
+
+def _simulate_latent_write(target: LatentKVCache, kv_lora_rank: int) -> None:
+    """Round the latent rows just written through MXFP4 when the
+    ``TOKENSPEED_SIMULATE_KV_QUANT`` debug recipe is set."""
+    recipe = simulated_kv_quant()
+    if recipe is None:
+        return
+    simulate_latent_write_(
+        recipe, target.kv_cache, target.slots, target.write_mask, kv_lora_rank
+    )
 
 
 class _CacheGroupSpecLike(Protocol):
