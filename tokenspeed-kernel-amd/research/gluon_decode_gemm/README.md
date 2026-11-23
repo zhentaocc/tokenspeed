@@ -23,6 +23,7 @@ cache) under HIP-graph replay.
 | script | purpose |
 |---|---|
 | `bench_gl3.py` | Config sweep or fixed configs (`--cfgs`) for `--mode gl3`, `--mode sk` and `--mode pers`. Baselines: `--mode torch` (default hipBLASLt) and `--mode tuned --tuned-file CSV` (replays a TunableOp results file). |
+| `bench_flydsl.py` | FlyDSL `gemm_a16w16_gfx950` config sweep next to default hipBLASLt (needs a FlyDSL source checkout). |
 | `stress_gemm.py` | Repeat-launch correctness stress. It catches split-K and Stream-K counter races. |
 | `bench_dp_tail.py` | Prototype of "full rounds of 256 tiles + split-K tail" built from two launches of the 3-stage kernel. |
 | `gl3_best_cfgs.json`, `sk_best_cfgs.json`, `pers_best_cfgs.json` | Best config per (shape, M), in `--cfgs` format. |
@@ -364,6 +365,30 @@ replay), best of up to 200 configs per point from its tuner space (`k_waves`
 - What Gluon can borrow: deeper split-K on o at small M (FlyDSL's o wins use
   split-K 3-6 with 128-wide N tiles; gl3's best o configs use split-K 1-3),
   and its tuner's pruning of configs by tile-quantization efficiency.
+
+## FlyDSL vs Gluon for a rewrite (gate_up, M = 256)
+
+`bench_flydsl.py` sweeps FlyDSL 0.5.3's `gemm_a16w16_gfx950` (260 valid
+configs) with the same timing. One container, three interleaved rounds on
+MI355X, median µs:
+
+| kernel | µs | vs tuned |
+|---|---|---|
+| hipBLASLt, tuned (MT144x256x64, 242 WGs) | 104.1 | - |
+| hipBLASLt, default | 113.4 | +9% |
+| Gluon persistent `256,128,64,4,2,3,256,8` | 115.9 | +11% |
+| FlyDSL `256x192x64`, 2x4 waves, 2 stages | 131.4 | +26% |
+
+- Neither language reproduces hipBLASLt's 144x256 tile, which fills 242 of
+  256 CUs in one round. FlyDSL needs `block_n * block_k` to be a multiple of
+  `threads * 8`, so 144-wide tiles only build with 2 waves (168 µs). In Gluon
+  a 144 = 128 + 16 split tile has a part too small for the loads; 160 = 128 +
+  32 builds but spills with 4 waves (317+ µs).
+- Two programs per CU (gl3 256x128 or 128x256, 2-4 stages) are slower, at
+  157+ µs.
+- FlyDSL 0.5.3 accepts some half-tile-interleaved configs that give wrong
+  results (block 64x256, 2x2 waves, relative error about 1), so the sweep
+  checks every config.
 
 ## Next step
 
