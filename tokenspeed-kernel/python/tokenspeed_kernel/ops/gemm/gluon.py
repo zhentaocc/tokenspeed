@@ -158,6 +158,15 @@ if platform.is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
         supports_gluon_mm_a16w16_decode_weight_gfx950 as _supports_decode_weight,
     )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm_streamk8w import (
+        gluon_mm_a16w16_streamk8w_gfx950_mm as _mm_a16w16_streamk8w_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm_streamk8w import (
+        gluon_mm_a16w16_streamk8w_num_counters_gfx950 as _mm_a16w16_streamk8w_counters,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm_streamk8w import (
+        supports_gluon_mm_a16w16_streamk8w_gfx950 as _supports_mm_a16w16_streamk8w,
+    )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.skinny import (
         compile_gluon_mm_a16w16_skinny_gfx950 as _compile_mm_a16w16_skinny,
     )
@@ -506,6 +515,47 @@ if platform.is_amd:
         output = _mm_a16w16_prefill_impl(A, B, out_dtype, alpha=alpha, out=out)
         if output is None:
             raise RuntimeError("registered gfx950 prefill shape was rejected")
+        return output
+
+    @register_kernel(
+        "gemm",
+        "mm",
+        name="gluon_mm_a16w16_streamk8w_gfx950",
+        solution="gluon",
+        capability=_GFX950_CAPABILITY,
+        signatures=_DENSE16_SIGNATURES,
+        priority=Priority.SPECIALIZED,
+        traits={
+            "mnk_problem_filter": frozenset({_supports_mm_a16w16_streamk8w}),
+            "a_inner_stride_one": frozenset({True}),
+            "b_inner_stride_one": frozenset({True}),
+            "b_layout": frozenset({"NK"}),
+            "out_dtype": frozenset({torch.bfloat16}),
+        },
+    )
+    def gluon_mm_a16w16_streamk8w_gfx950(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        A_scales: torch.Tensor | None,
+        B_scales: torch.Tensor | None,
+        out_dtype: torch.dtype,
+        *,
+        alpha: torch.Tensor | None,
+        block_size: list[int] | None,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Opt-in (TOKENSPEED_GLUON_STREAMK8W=1) hybrid Stream-K GEMM for the
+        measured shapes where it beats tuned hipBLASLt."""
+        _validate_dense16_mm_arguments(A_scales, B_scales, block_size)
+        M, K = A.shape
+        counters = zeroed_state(
+            _mm_a16w16_streamk8w_counters(M, B.shape[0], K),
+            dtype=torch.int32,
+            device=A.device,
+        )
+        output = _mm_a16w16_streamk8w_impl(A, B, out=out, counters=counters)
+        if alpha is not None:
+            output.mul_(alpha.to(device=output.device, dtype=output.dtype))
         return output
 
     @register_kernel(

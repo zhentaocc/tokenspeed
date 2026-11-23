@@ -25,6 +25,7 @@ cache) under HIP-graph replay.
 | `bench_gl3.py` | Config sweep or fixed configs (`--cfgs`) for `--mode gl3`, `--mode sk` and `--mode pers`. Baselines: `--mode torch` (default hipBLASLt) and `--mode tuned --tuned-file CSV` (replays a TunableOp results file). |
 | `bench_flydsl.py` | FlyDSL `gemm_a16w16_gfx950` config sweep next to default hipBLASLt (needs a FlyDSL source checkout). |
 | `stress_gemm.py` | Repeat-launch correctness stress. It catches split-K and Stream-K counter races. |
+| `bench_sk8w.py` | Sweep or fixed configs of the 8-wave hybrid Stream-K kernel (`mm_streamk8w.py`) next to hipBLASLt (`--tuned-file CSV` for the tuned rows). |
 | `bench_dp_tail.py` | Prototype of "full rounds of 256 tiles + split-K tail" built from two launches of the 3-stage kernel. |
 | `gl3_best_cfgs.json`, `sk_best_cfgs.json`, `pers_best_cfgs.json` | Best config per (shape, M), in `--cfgs` format. |
 
@@ -389,6 +390,50 @@ MI355X, median µs:
 - FlyDSL 0.5.3 accepts some half-tile-interleaved configs that give wrong
   results (block 64x256, 2x2 waves, relative error about 1), so the sweep
   checks every config.
+
+## 8-wave hybrid Stream-K (`mm_streamk8w.py`)
+
+One persistent 8-wave program per CU runs largem's warp-pipelined quadrant
+schedule on `2*BMH x 2*BNH` tiles (128 or 256 per side) with 2-4 LDS buffers.
+The ragged last round of tiles (`SK` 1) or that plus one full round (`SK` 2)
+is done Stream-K style, split over the XCDs so the FP32 partials of a tile stay
+in one XCD's L2; the other tiles run data-parallel. A config is
+`(BMH, BNH, WM, WN, GRID, NUM_XCDS, SK, NS)`; `NS` 0 is largem's two-buffer
+pair schedule.
+
+```bash
+python bench_sk8w.py --shapes gate_up,qkv,gdn_in,o,down --rows 256,512,128,64 --tuned-file CSV --reps 10
+python bench_sk8w.py --shapes gate_up --rows 480,496,512 --cfgs '[[128,128,4,2,256,8,1,2]]' --tuned-file CSV --rounds 3
+```
+
+Best config per cell against tuned hipBLASLt in the same session (µs, one
+sweep, ratio < 1 is a win):
+
+| shape | M=64 | M=128 | M=256 | M=512 |
+|---|---|---|---|---|
+| qkv | 47.2 / 32.2 (1.46) | 50.0 / 40.1 (1.25) | 58.9 / 59.5 (0.99) | 78.4 / 77.5 (1.01) |
+| o | 29.4 / 19.4 (1.52) | 30.8 / 22.6 (1.36) | 42.4 / 33.1 (1.28) | 62.6 / 47.1 (1.33) |
+| gdn_in | 52.9 / 38.2 (1.38) | 56.4 / 46.1 (1.22) | 75.4 / 72.1 (1.05) | 108.0 / 93.1 (1.16) |
+| gate_up | 86.2 / 65.0 (1.33) | 93.6 / 78.3 (1.20) | 115.7 / 122.1 (0.95) | 168.6 / 188.3 (0.90) |
+| down | 54.2 / 39.7 (1.37) | 63.6 / 49.2 (1.29) | 94.2 / 70.3 (1.34) | 149.9 / 97.7 (1.53) |
+
+Three interleaved rounds on gate_up (median µs, kernel / tuned):
+
+| M | 192 | 224 | 256 | 288 | 320 | 384 | 448 | 464 | 480 | 496 | 512 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| kernel | 114.2 | 114.5 | 113.7 | 161.0 | 163.9 | 165.6 | 166.9 | 172.9 | 169.8 | 170.4 | 173.5 |
+| tuned | 88.7 | 96.4 | 105.0 | 158.2 | 159.4 | 136.6 | 148.7 | 184.5 | 172.7 | 193.9 | 186.9 |
+
+Only gate_up at M = 481-512 wins reliably (256x256 tiles: 256 data-parallel
+tiles + 16 Stream-K tiles, 7-12% under hipBLASLt). The gate_up M = 256 win of
+the first sweep did not repeat. The 256x256 data-parallel tile itself is
+efficient (about 130 µs for exactly 256 tiles at N = 32768, M = 512, against
+155 for hipBLASLt), but any Stream-K share costs a full FP32 tile of partial
+writes and reads per piece: at 20 GB/s per CU when every CU streams, 128-256 KB
+per piece is 8-15 µs on top of the K work. That is why the skinny shapes
+(o, down, M <= 128) stay 20-50% behind hipBLASLt's narrower tiles.
+`select_gluon_mm_a16w16_streamk8w_gfx950` holds that one measured range; the
+gemm registry routes it only with `TOKENSPEED_GLUON_STREAMK8W=1`.
 
 ## Next step
 
