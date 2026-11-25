@@ -168,6 +168,53 @@ def _kv_planes(k_cache, v_cache, k_sf, v_sf, fmt, d):
     return kd, ks, vd, vs, kps, sps
 
 
+@triton.jit
+def _mx4_dequant_pages_kernel(
+    kc_ptr,
+    vc_ptr,
+    ids_ptr,
+    ko_ptr,
+    vo_ptr,
+    PS: tl.constexpr,
+    ROWS: tl.constexpr,
+    D: tl.constexpr,
+):
+    i = tl.program_id(0).to(tl.int64)
+    src = tl.load(ids_ptr + i).to(tl.int64)
+    offs_r = tl.arange(0, ROWS)
+    od = offs_r[:, None] * (D // 2) + tl.arange(0, D // 2)[None, :]
+    os_ = ROWS * (D // 2) + offs_r[:, None] * (D // 32) + tl.arange(0, D // 32)[None, :]
+    oo = i * ROWS * D + offs_r[:, None] * D + tl.arange(0, D)[None, :]
+    for which in tl.static_range(2):
+        base = (kc_ptr if which == 0 else vc_ptr) + src * PS
+        x = _mx4_dequant_hw(tl.load(base + od), tl.load(base + os_), ROWS, D)
+        tl.store((ko_ptr if which == 0 else vo_ptr) + oo, x)
+
+
+def mx4_dequant_pages(k_cache, v_cache, page_ids, k_out, v_out):
+    """Dequantize fused MXFP4 pages ``page_ids`` into BF16 pages.
+
+    k_cache/v_cache u8 [pages, P, H, D//2 + D//32] (fused layout); page_ids
+    [N]; k_out/v_out bf16 [N, P, H, D] receive page ``page_ids[i]`` at ``i``.
+    """
+    n, page, h, d = k_out.shape
+    if n == 0:
+        return
+    assert k_cache.is_contiguous() and v_cache.is_contiguous()
+    assert k_cache.shape[1] == page and k_cache.shape[-1] == d // 2 + d // 32
+    _mx4_dequant_pages_kernel[(n,)](
+        k_cache,
+        v_cache,
+        page_ids,
+        k_out,
+        v_out,
+        PS=page * h * (d // 2 + d // 32),
+        ROWS=page * h,
+        D=d,
+        num_warps=4,
+    )
+
+
 # --------------------------------------------------------------------------- #
 # tile helpers
 # --------------------------------------------------------------------------- #

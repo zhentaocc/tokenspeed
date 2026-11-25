@@ -164,3 +164,14 @@ def test_extend(fmt, prefix, qlens, window_left):
     )
     ref = _ref(q, kq, vq, pt, seqlens, qlens, window_left, D**-0.5)
     assert _rel(out, ref) < (1e-2 if fmt == "w4a16ds" else 2e-1)
+
+
+def test_dequant_pages_matches_codec():
+    mx = _mx()
+    pt, kc, vc, kq, vq = _cache(1, 20 * P, seed=7)
+    ids = pt[0, ::3].contiguous()
+    k_out = torch.empty(ids.shape[0], P, H, D, dtype=torch.bfloat16, device="cuda")
+    v_out = torch.empty_like(k_out)
+    mx.mx4_dequant_pages(kc, vc, ids, k_out, v_out)
+    assert torch.equal(k_out, kq[ids.long()].to(torch.bfloat16))
+    assert torch.equal(v_out, vq[ids.long()].to(torch.bfloat16))
