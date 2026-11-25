@@ -3573,13 +3573,19 @@ class ServerArgs:
             "--kv-cache-dtype",
             type=str,
             default=ServerArgs.kv_cache_dtype,
-            choices=["auto", "bfloat16", "fp8", "fp8_e4m3", "mxfp8"],
+            choices=["auto", "bfloat16", "fp8", "fp8_e4m3", "mxfp8", "mxfp4"],
             help='Data type for kv cache storage. "auto" and "bfloat16" store BF16 '
             'rows (fp16 activations convert on write). "fp8" is an alias for '
             '"fp8_e4m3" (unit scale, or the checkpoint\'s per-tensor KV-cache '
             'scales where the model loads them). "mxfp8" stores '
             "block-scaled fp8-e4m3 (one UE8M0 scale per 32 head_dim elements) and "
-            "requires an MHA attention backend.",
+            'requires an MHA attention backend. "mxfp4" stores OCP MXFP4 '
+            "(E2M1 values, one UE8M0 scale per 32 head_dim elements, 34 bytes "
+            "per head row at head_dim 64) and requires the paged MHA backend; "
+            "TOKENSPEED_MXFP4_KV_ATTN picks the attention arithmetic (w4a16, "
+            "the default, dequantizes K/V to BF16; w4a4 also quantizes the "
+            "query and runs QK on the scaled FP4 MFMA; prefill_w4a4 runs "
+            "prefill as w4a4 and decode as w4a16).",
         )
         parser.add_argument(
             "--kv-cache-quant-method",

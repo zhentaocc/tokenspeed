@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from functools import partial
 from typing import TYPE_CHECKING
@@ -183,6 +184,13 @@ class MHAAttnBackend(PagedAttentionBackend):
         self.qkv_dtype = config.dtype
         self.kv_cache_dtype = config.kv_cache_dtype
         self.is_mxfp8 = bool(config.kv_cache_mxfp8)
+        self.is_mxfp4 = bool(getattr(config, "kv_cache_mxfp4", False))
+        # w4a16: K/V dequantized to BF16 in the kernel. w4a4: the query too is
+        # quantized to MXFP4 and QK runs on the scaled FP4 MFMA. prefill_w4a4:
+        # extend as w4a4, decode as w4a16.
+        self.mxfp4_attn = os.environ.get("TOKENSPEED_MXFP4_KV_ATTN", "w4a16")
+        if self.mxfp4_attn not in ("w4a16", "w4a4", "prefill_w4a4"):
+            raise ValueError(f"TOKENSPEED_MXFP4_KV_ATTN={self.mxfp4_attn!r}")
         # mxfp8 shares the fp8 storage dtype but uses block scales; keep it off
         # the per-tensor casts
         self.is_fp8 = (
@@ -522,6 +530,102 @@ class MHAAttnBackend(PagedAttentionBackend):
         # or runs the separate op after where none here can.
         return True
 
+    # ------------------------------------------------------------------
+    # MXFP4 KV
+    # ------------------------------------------------------------------
+
+    def _mxfp4_fmt(self, decode: bool) -> int:
+        from tokenspeed_kernel.ops.attention.mxfp4_kv import FMT_NAMES
+
+        a4 = self.mxfp4_attn == "w4a4" or (
+            self.mxfp4_attn == "prefill_w4a4" and not decode
+        )
+        return FMT_NAMES["w4a4" if a4 else "w4a16ds"]
+
+    def _mxfp4_pages(self, layer: PagedAttention, token_to_kv_pool):
+        k_raw = token_to_kv_pool.get_key_buffer(layer.layer_id)
+        v_raw = token_to_kv_pool.get_value_buffer(layer.layer_id)
+        row = k_raw.shape[-1]
+        if k_raw.ndim == 4 and k_raw.shape[1] == self.kernel_page_size:
+            return k_raw, v_raw
+        shape = (-1, self.kernel_page_size, layer.tp_k_head_num, row)
+        return k_raw.view(shape), v_raw.view(shape)
+
+    def _mxfp4_store(self, layer, out_cache_loc, token_to_kv_pool):
+        """Quantize this forward's staged K/V rows into the MXFP4 pages."""
+        from tokenspeed_kernel.ops.attention.mxfp4_kv import mx4_store_kv
+
+        k_cache, v_cache = self._mxfp4_pages(layer, token_to_kv_pool)
+        rows = out_cache_loc.shape[0]
+        k_rows, v_rows = token_to_kv_pool.staged_rows(rows)
+        mx4_store_kv(k_rows, v_rows, out_cache_loc, k_cache, None, v_cache, None)
+        return k_cache, v_cache
+
+    def _mxfp4_decode(self, q, layer, out_cache_loc, token_to_kv_pool, gate):
+        from tokenspeed_kernel.ops.attention.mxfp4_kv import mx4_decode
+
+        if layer.logit_cap or layer.sliding_window_sink or self.draft_block_decode:
+            raise NotImplementedError(
+                "mxfp4 KV decode: no logit cap, sinks or block drafts"
+            )
+        k_cache, v_cache = self._mxfp4_store(layer, out_cache_loc, token_to_kv_pool)
+        metadata = self.forward_decode_metadata
+        qlen = q.shape[0] // metadata.seq_lens.shape[0]
+        output = mx4_decode(
+            q,
+            k_cache,
+            v_cache,
+            metadata.page_table,
+            metadata.seq_lens,
+            fmt=self._mxfp4_fmt(decode=True),
+            window_left=layer.sliding_window_size,
+            qlen=qlen,
+            softmax_scale=layer.scaling,
+        )
+        output = output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
+        if gate is None:
+            return output
+        return weightless_rmsnorm_gated_sigmoid(
+            output,
+            gate.gate,
+            layer.tp_q_head_num,
+            layer.v_head_dim,
+            gate.eps,
+            pdl_enabled(),
+        )
+
+    def _mxfp4_extend(self, q, k, v, layer, out_cache_loc, token_to_kv_pool, sinks):
+        from tokenspeed_kernel.ops.attention.mxfp4_kv import mx4_extend
+
+        if layer.logit_cap or layer.sliding_window_sink or sinks is not None:
+            raise NotImplementedError("mxfp4 KV extend: no logit cap or sinks")
+        k_cache, v_cache = self._mxfp4_store(layer, out_cache_loc, token_to_kv_pool)
+        metadata = self.forward_extend_metadata
+        fmt = self._mxfp4_fmt(decode=False)
+        if (
+            self.mxfp4_attn == "w4a16"
+            and not metadata.is_mixed
+            and metadata.max_extend_prefix_len == 0
+        ):
+            # A fresh prefill attends its own BF16 rows, as an FP8 cache does.
+            return self._forward_prefill(q, k, v, layer, metadata, sinks)
+        (q,) = _slice_extend_inputs(metadata, q)
+        output = mx4_extend(
+            q,
+            k_cache,
+            v_cache,
+            metadata.page_table,
+            metadata.seq_lens,
+            metadata.cu_extend_seq_lens,
+            metadata.max_extend_seq_len,
+            fmt=fmt,
+            window_left=layer.sliding_window_size,
+            softmax_scale=layer.scaling,
+            block_q=16,
+            ppi=2,
+        )
+        return output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
+
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -538,6 +642,10 @@ class MHAAttnBackend(PagedAttentionBackend):
         assert layer.qk_head_dim == layer.v_head_dim
 
         q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        if self.is_mxfp4:
+            return self._mxfp4_decode(
+                q, layer, out_cache_loc, token_to_kv_pool, rmsnorm_output_gate
+            )
         metadata = self.forward_decode_metadata
         max_seqlen_q = q.shape[0] // metadata.seq_lens.shape[0]
 
@@ -752,6 +860,10 @@ class MHAAttnBackend(PagedAttentionBackend):
 
         metadata = self.forward_extend_metadata
         sinks = kwargs.get("sinks")
+        if self.is_mxfp4:
+            return self._mxfp4_extend(
+                q, k, v, layer, out_cache_loc, token_to_kv_pool, sinks
+            )
         plan = self.plan(
             window_left=layer.sliding_window_size,
             logit_cap=layer.logit_cap,

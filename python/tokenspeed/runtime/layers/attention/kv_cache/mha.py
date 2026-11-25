@@ -450,3 +450,70 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
         }.values():
             v_size += sf.numel() * sf.element_size()
         return k_size, v_size
+
+
+class MHATokenToKVPoolMXFP4(MHATokenToKVPool):
+    """MHA KV pool storing OCP MXFP4 head rows.
+
+    Each page of a layer's K (or V) field is ``[page, heads, head_dim // 2]``
+    packed E2M1 bytes (even element in the low nibble) followed by
+    ``[page, heads, head_dim // 32]`` UE8M0 scales; the field is shaped
+    ``[page, heads, head_dim // 2 + head_dim // 32]`` uint8 so the arena sizes
+    it exactly. ``tokenspeed_kernel.ops.attention.mxfp4_kv`` reads this
+    layout (``mx4_planes``).
+
+    The attention prologue writes BF16 rows to a staging buffer shared by all
+    layers (rows in prologue order); the attention backend quantizes the
+    forward's rows into the pages (``staged_rows``) before it attends.
+    Layers run one after another, so one buffer serves them all.
+    """
+
+    STAGING_ROWS: ClassVar[int] = 65536
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        if self._layer_kv_head_counts is not None:
+            raise NotImplementedError("mxfp4 KV cache needs uniform K/V head counts")
+        device = next(b for b in self.k_buffer if b is not None).device
+        self._stage_k: torch.Tensor | None = None
+        self._stage_v: torch.Tensor | None = None
+        self._stage_index: dict[torch.dtype, torch.Tensor] = {}
+        self._grow_staging(self.STAGING_ROWS, device)
+
+    def _grow_staging(self, rows: int, device: torch.device) -> None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                f"mxfp4 KV staging needs {rows} rows during graph capture; "
+                f"raise MHATokenToKVPoolMXFP4.STAGING_ROWS"
+            )
+        shape = (rows, self.head_num, self.head_dim)
+        self._stage_k = torch.empty(shape, dtype=torch.bfloat16, device=device)
+        self._stage_v = torch.empty(shape, dtype=torch.bfloat16, device=device)
+        index = torch.arange(rows, dtype=torch.int64, device=device)
+        self._stage_index = {torch.int64: index, torch.int32: index.int()}
+
+    @override
+    def kv_write_target(
+        self, layer_id: int, slots: torch.Tensor, write_mask: torch.Tensor | None
+    ) -> HeadKVCache:
+        """The staging rows the prologue writes, in prologue row order."""
+        _head_rows_are_never_masked(write_mask)
+        rows = slots.shape[0]
+        if rows > self._stage_k.shape[0]:
+            self._grow_staging(rows, slots.device)
+        return HeadKVCache(
+            k_cache=self._stage_k,
+            v_cache=self._stage_v,
+            scales=None,
+            slots=self._stage_index[slots.dtype][:rows],
+        )
+
+    def staged_rows(self, rows: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """The leading ``rows`` staged BF16 K/V rows of the current layer."""
+        return self._stage_k[:rows], self._stage_v[:rows]
+
+    @override
+    def set_kv_buffer(self, layer, loc, cache_k, cache_v):
+        # The page layout is defined at the attention kernel's page size,
+        # which only the backend knows; it stores through the staging rows.
+        raise NotImplementedError("mxfp4 KV rows are stored by the attention backend")
